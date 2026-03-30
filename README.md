@@ -17,9 +17,14 @@
    - [Step 7: Classify the Alert](#step-7-classify-the-alert)
    - [Step 8: Update the Alert Status](#step-8-update-the-alert-status)
 5. [Remediation — If Fraud Is Confirmed](#remediation--if-fraud-is-confirmed)
-6. [Preventive Measures](#preventive-measures)
-7. [Useful Links](#useful-links)
-8. [FAQ](#faq)
+6. [Advanced: SOC Analyst Investigation](#advanced-soc-analyst-investigation)
+   - [Sentinel Workspace Setup](#sentinel-workspace-setup)
+   - [KQL Queries for Fraud Indicators](#kql-queries-for-fraud-indicators)
+   - [Investigation Workflow for SOC Analysts](#investigation-workflow-for-soc-analysts)
+   - [Generic SIEM Guidance](#generic-siem-guidance)
+7. [Preventive Measures](#preventive-measures)
+8. [Useful Links](#useful-links)
+9. [FAQ](#faq)
 
 ---
 
@@ -264,6 +269,202 @@ If your investigation confirms unauthorized activity, take these actions **immed
 
 - [Reduce unused Azure quota](https://learn.microsoft.com/en-us/azure/quotas/quotas-overview) on the subscription to prevent future abuse at scale
 - Review and tighten the customer's [Azure spending budget](https://learn.microsoft.com/en-us/partner-center/billing/set-an-azure-spending-budget-for-your-customers)
+
+---
+
+## Advanced: SOC Analyst Investigation
+
+This section is for MSPs with a Security Operations Center (SOC) or dedicated security analysts who have Azure telemetry flowing into a SIEM. It covers how to investigate Azure fraud advisories using **Microsoft Sentinel** and provides guidance adaptable to other SIEM platforms.
+
+### Sentinel Workspace Setup
+
+To investigate Azure fraud alerts in Sentinel, ensure the following **data connectors** are enabled on customer tenants:
+
+| Data Connector | Log Table | Why It Matters |
+|---|---|---|
+| **Azure Activity** | `AzureActivity` | Resource creation, RBAC changes, subscription-level operations |
+| **Microsoft Entra ID** | `SigninLogs`, `AuditLogs` | Sign-in anomalies, credential stuffing, admin activity |
+| **Microsoft Entra ID Protection** | `SecurityAlert` | Risky users, risky sign-ins, identity compromise signals |
+| **Microsoft Defender for Cloud** | `SecurityAlert`, `SecurityRecommendation` | Threat detections, misconfigurations, anomalous resource behavior |
+| **Azure Key Vault** (if applicable) | `AzureDiagnostics` | Unauthorized secret/key access |
+
+> 💡 **Tip:** If you manage multiple customer tenants, use [Azure Lighthouse](https://learn.microsoft.com/en-us/azure/lighthouse/overview) to centralize Sentinel monitoring across tenants in a single workspace.
+
+### KQL Queries for Fraud Indicators
+
+Run these queries in **Sentinel → Logs** or **Log Analytics** against the affected customer workspace.
+
+#### 1. Detect Unusual Resource Deployments
+
+Look for resource creation events that may indicate crypto mining or unauthorized compute:
+
+```kql
+AzureActivity
+| where TimeGenerated > ago(7d)
+| where OperationNameValue has_any ("Microsoft.Compute/virtualMachines/write", 
+    "Microsoft.ContainerInstance/containerGroups/write",
+    "Microsoft.MachineLearningServices/workspaces/computes/write")
+| where ActivityStatusValue == "Success"
+| project TimeGenerated, Caller, CallerIpAddress, OperationNameValue, 
+    ResourceGroup, _ResourceId, Properties
+| sort by TimeGenerated desc
+```
+
+#### 2. Identify VM Deployments in Unusual Regions
+
+Flag compute resources spun up in regions the customer doesn't normally use:
+
+```kql
+AzureActivity
+| where TimeGenerated > ago(7d)
+| where OperationNameValue == "Microsoft.Compute/virtualMachines/write"
+| where ActivityStatusValue == "Success"
+| extend Region = tostring(parse_json(Properties).resource_location)
+| summarize Count = count(), Callers = make_set(Caller) by Region
+| sort by Count desc
+```
+
+#### 3. Detect Suspicious RBAC Role Assignments
+
+Catch unauthorized privilege escalation:
+
+```kql
+AzureActivity
+| where TimeGenerated > ago(7d)
+| where OperationNameValue == "Microsoft.Authorization/roleAssignments/write"
+| where ActivityStatusValue == "Success"
+| extend RoleDefinitionId = tostring(parse_json(Properties).requestbody)
+| project TimeGenerated, Caller, CallerIpAddress, ResourceGroup, 
+    RoleDefinitionId, _ResourceId
+| sort by TimeGenerated desc
+```
+
+#### 4. Anomalous Sign-Ins (Entra ID)
+
+Identify sign-ins from unfamiliar locations or flagged as risky:
+
+```kql
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where ResultType == 0  // Successful sign-ins
+| where RiskLevelDuringSignIn in ("high", "medium") 
+    or RiskLevelAggregated in ("high", "medium")
+| project TimeGenerated, UserPrincipalName, IPAddress, Location, 
+    AppDisplayName, RiskLevelDuringSignIn, RiskLevelAggregated, 
+    DeviceDetail, ConditionalAccessStatus
+| sort by TimeGenerated desc
+```
+
+#### 5. Detect Credential Stuffing Patterns
+
+Look for bursts of failed sign-ins followed by a success:
+
+```kql
+let FailedAttempts = SigninLogs
+| where TimeGenerated > ago(7d)
+| where ResultType != 0
+| summarize FailCount = count(), 
+    FailedIPs = make_set(IPAddress) by UserPrincipalName, bin(TimeGenerated, 1h);
+let SuccessAfterFail = SigninLogs
+| where TimeGenerated > ago(7d)
+| where ResultType == 0;
+FailedAttempts
+| where FailCount > 10
+| join kind=inner (SuccessAfterFail) on UserPrincipalName
+| where SuccessAfterFail.TimeGenerated between (FailedAttempts.TimeGenerated .. (FailedAttempts.TimeGenerated + 2h))
+| project UserPrincipalName, FailCount, FailedIPs, 
+    SuccessTime = SuccessAfterFail.TimeGenerated, 
+    SuccessIP = SuccessAfterFail.IPAddress
+```
+
+#### 6. Unauthorized Application Consent Grants
+
+Detect OAuth consent grants that may indicate a consent phishing attack:
+
+```kql
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName == "Consent to application"
+| extend ConsentActor = tostring(InitiatedBy.user.userPrincipalName)
+| extend TargetApp = tostring(TargetResources[0].displayName)
+| project TimeGenerated, ConsentActor, TargetApp, 
+    AdditionalDetails, CorrelationId
+| sort by TimeGenerated desc
+```
+
+#### 7. Cost Spike Detection (if cost data is ingested)
+
+If you export Azure cost data to Log Analytics:
+
+```kql
+AzureActivity
+| where TimeGenerated > ago(30d)
+| where OperationNameValue has "Microsoft.Compute"
+| where ActivityStatusValue == "Success"
+| summarize DailyOperations = count() by bin(TimeGenerated, 1d)
+| render timechart
+```
+
+### Investigation Workflow for SOC Analysts
+
+When a fraud advisory alert lands in your SOC queue, follow this triage workflow:
+
+```
+┌─────────────────────────────────────────────────┐
+│  1. ALERT INTAKE                                │
+│  • Validate alert in Partner Center Dashboard   │
+│  • Create incident ticket in your ITSM          │
+│  • Assign severity: HIGH                        │
+└──────────────────────┬──────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────┐
+│  2. INITIAL TRIAGE (Target: < 30 min)           │
+│  • Run KQL #1 & #2 — check for rogue resources │
+│  • Run KQL #3 — check for RBAC changes         │
+│  • Run KQL #4 — check for risky sign-ins       │
+│  • Check Azure Activity Log for the sub         │
+└──────────────────────┬──────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────┐
+│  3. DEEP INVESTIGATION                          │
+│  • Run KQL #5 — credential stuffing patterns    │
+│  • Run KQL #6 — consent grant abuse             │
+│  • Correlate IPs across SigninLogs & Activity    │
+│  • Review resource configs for persistence      │
+│    (automation accounts, logic apps, webhooks)  │
+│  • Check for data exfiltration (storage logs)   │
+└──────────────────────┬──────────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────┐
+│  4. CLASSIFICATION & RESPONSE                   │
+│  • Classify: Legitimate / Fraud / Ignore        │
+│  • If Fraud → execute Remediation playbook      │
+│  • Update alert in Partner Center               │
+│  • Document findings in incident ticket         │
+│  • Notify stakeholders                          │
+└─────────────────────────────────────────────────┘
+```
+
+### Generic SIEM Guidance
+
+If you're using a SIEM other than Sentinel (e.g., Splunk, QRadar, Elastic, Chronicle):
+
+| What to Ingest | Source | Purpose |
+|---|---|---|
+| Azure Activity Logs | [Azure Event Hub](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/activity-log?tabs=powershell) or Diagnostic Settings export | Resource-level operations, RBAC changes |
+| Entra ID Sign-In & Audit Logs | [Microsoft Graph API](https://learn.microsoft.com/en-us/graph/api/signin-list) or Event Hub streaming | Identity-based threat detection |
+| Defender for Cloud Alerts | [Continuous export](https://learn.microsoft.com/en-us/azure/defender-for-cloud/continuous-export) to Event Hub | Security threat detections |
+| Azure Cost Data | [Cost Management export](https://learn.microsoft.com/en-us/azure/cost-management-billing/costs/tutorial-export-acm-data) | Spending anomaly detection |
+
+**Key detection rules to build in any SIEM:**
+
+1. **New VM in unusual region** — Alert when compute resources are created outside known customer regions
+2. **RBAC Owner/Contributor added** — Alert on any new privileged role assignment
+3. **High-risk sign-in followed by resource creation** — Correlate risky identity signals with Azure resource operations within a short time window
+4. **Burst resource creation** — Alert when more than N resources are created within a short period (e.g., 10+ VMs in 1 hour)
+5. **Cost threshold breach** — Alert when daily spend exceeds a defined baseline by a configurable percentage
+
+> 📖 **For Sentinel-specific automation:** Consider building [Sentinel Playbooks (Logic Apps)](https://learn.microsoft.com/en-us/azure/sentinel/automate-responses-with-playbooks) to auto-enrich fraud advisory alerts with KQL query results and notify your SOC team via Teams/email.
 
 ---
 
